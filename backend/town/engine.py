@@ -41,6 +41,7 @@ from .request_state import (
 )
 from .cognition_store import CognitionStore
 from .interaction_store import InteractionRecord, InteractionStore
+from .procedures import ProcedureStore
 from .world_pack import DEFAULT_WORLD
 
 
@@ -70,6 +71,7 @@ class SimulationEngine:
         self.town_agent = TownAgent(self.world_pack)
         self.dialogue_store = DialogueStore(self.memory.db_path)
         self.cognition_store = CognitionStore(self.memory.db_path)
+        self.procedure_store = ProcedureStore(self.memory.db_path)
         self.interaction_store = InteractionStore(self.memory.db_path)
         self._interactions: dict[str, InteractionRecord] = {}
 
@@ -80,6 +82,7 @@ class SimulationEngine:
 
         # ── Embedding provider for perception-association ──
         self.embedding_provider = EmbeddingProvider()
+        self.procedure_store.provider = self.embedding_provider
         self.memory.set_embedding_provider(self.embedding_provider)
         self.memory_formation = MemoryFormation(self.memory, self.llm, self.trace)
         self.fact_ledger = FactLedger()
@@ -180,12 +183,19 @@ class SimulationEngine:
         self.trace.db_path = storage_path
         self.dialogue_store.db_path = storage_path
         self.cognition_store.db_path = storage_path
+        self.procedure_store.db_path = storage_path
         self.interaction_store.db_path = storage_path
         await self.memory.init_db()
         await self.relationship_store.init_db()
         await self.trace.init_db()
         await self.dialogue_store.init_db()
         await self.cognition_store.init_db()
+        migrated = await self.procedure_store.init_db()
+        for key in migrated:
+            self._run_in_background(
+                lambda key=key: self.procedure_store.index(key),
+                "procedure_index_failed", self.get_sim_time_str(),
+            )
         await self.interaction_store.init_db()
         self._init_agents()
         for agent in self.agents:
@@ -287,6 +297,21 @@ class SimulationEngine:
         if q in self._subscribers:
             self._subscribers.remove(q)
 
+    async def _complete_plan_step(self, agent, step_id):
+        experience = agent.mental_state.complete_plan_step(step_id, self.get_sim_timestamp())
+        if experience:
+            key = await self.procedure_store.learn(agent.id, experience)
+            self._run_in_background(
+                lambda: self.procedure_store.index(key), "procedure_index_failed", self.get_sim_time_str(),
+            )
+
+    async def _block_plan(self, agent, plan, fact_id, reason):
+        if plan.status != "blocked" and plan.experience_id:
+            await self.procedure_store.fail(
+                agent.id, plan.experience_id, reason, self.get_sim_timestamp(),
+            )
+        plan.block_current_step(fact_id, reason)
+
     async def _persist_cognition(self) -> None:
         for agent in self.agents:
             await self.cognition_store.save_agent(agent, self.habits)
@@ -340,14 +365,7 @@ class SimulationEngine:
     async def shutdown(self) -> None:
         """Stop deferred work before closing the shared provider connection."""
         self.running = False
-        tasks = [
-            *(task for _, task in self._planning_tasks.values()),
-            *(task for _, task in self._daily_plan_tasks.values()),
-            *(task for _, task, _ in self._routine_choice_tasks.values()),
-            *(task for _, task in self._dialogue_turn_tasks.values()),
-            *self._background_tasks,
-        ]
-        self._cancel_deferred_tasks()
+        tasks = self._cancel_deferred_tasks()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self._persist_cognition()
@@ -356,7 +374,9 @@ class SimulationEngine:
     async def reset(self):
         self.running = False
         self._realtime_llm = False
-        self._cancel_deferred_tasks()
+        tasks = self._cancel_deferred_tasks()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self.day = 1
         self.hour = config.SIM_START_HOUR
         self.minute = 0
@@ -391,6 +411,7 @@ class SimulationEngine:
         await self.relationship_store.clear()
         await self.dialogue_store.clear()
         await self.cognition_store.clear()
+        await self.procedure_store.clear()
         await self.interaction_store.clear()
         self._init_agents()
         await self.broadcast()
@@ -398,18 +419,19 @@ class SimulationEngine:
     def set_speed(self, speed: float):
         self.speed = max(0.1, min(speed, 10.0))
 
-    def _cancel_deferred_tasks(self) -> None:
-        """Invalidate work created before a reset and release pending waiters."""
+    def _cancel_deferred_tasks(self) -> list[asyncio.Task]:
+        """Invalidate work and return tasks for shutdown/reset to drain."""
         self._task_generation += 1
-        for _, task in self._planning_tasks.values():
-            task.cancel()
-        for _, task in self._daily_plan_tasks.values():
-            task.cancel()
-        for _, task, _ in self._routine_choice_tasks.values():
-            task.cancel()
-        for _, task in self._dialogue_turn_tasks.values():
-            task.cancel()
-        for task in self._background_tasks:
+        tasks = [
+            *(task for _, task in self._planning_tasks.values()),
+            *(task for _, task in self._daily_plan_tasks.values()),
+            *(task for _, task, _ in self._routine_choice_tasks.values()),
+            *(task for _, task in self._dialogue_turn_tasks.values()),
+            *self._background_tasks,
+        ]
+        for task in tasks:
+            if task.done() and not task.cancelled():
+                task.exception()
             task.cancel()
         self._planning_tasks.clear()
         self._daily_plan_tasks.clear()
@@ -420,6 +442,7 @@ class SimulationEngine:
         self._routine_choice_request_states.clear()
         self._dialogue_request_states.clear()
         self._background_tasks.clear()
+        return tasks
 
     def _run_in_background(self, work, label: str, sim_time: str) -> None:
         """Run non-critical enrichment without making the simulation wait."""
@@ -451,7 +474,7 @@ class SimulationEngine:
     async def _daily_plan_in_background(self, agent: Agent, sim_time_str: str,
                                         reason: str = ""):
         context = await agent.build_planning_context(
-            sim_time_str, self, task_type="intention_proposal",
+            sim_time_str, self, task_type="daily_plan",
         )
         return await self.planner.create_daily_plan(agent, self, context, reason)
 
@@ -614,7 +637,7 @@ class SimulationEngine:
                     )
                     continue
                 except Exception as exc:
-                    plan.block_current_step("", str(exc))
+                    await self._block_plan(agent, plan, "", str(exc))
 
             # Live planning runs in the background so an observed failure can
             # produce a new branch without stalling the simulation clock.
@@ -725,7 +748,7 @@ class SimulationEngine:
                 or (plan.review_at <= now and plan.current_step is None)
             )
             if plan and plan.status == "active" and plan.current_step and plan.current_step.status == "executing":
-                plan.block_current_step("", "执行状态与角色空闲状态不一致")
+                await self._block_plan(agent, plan, "", "执行状态与角色空闲状态不一致")
                 needs_plan = True
             if needs_plan:
                 planning_agents.append(agent)
@@ -737,7 +760,7 @@ class SimulationEngine:
                     str(decisions[agent.id])[:200],
                 )
             except Exception as exc:
-                plan.block_current_step("", str(exc))
+                await self._block_plan(agent, plan, "", str(exc))
                 planning_agents.append(agent)
 
         # A plan is retained across ticks. Retry only plan creation failures;
@@ -774,7 +797,7 @@ class SimulationEngine:
                 try:
                     decisions[agent.id] = self.planner.next_plan_action(agent, self)
                 except Exception as exc:
-                    result.block_current_step("", str(exc))
+                    await self._block_plan(agent, result, "", str(exc))
                     still_planning.append(agent)
             planning_agents = still_planning
             if planning_agents and not self.llm.fallback:
@@ -1038,12 +1061,9 @@ class SimulationEngine:
                 duration=max(0, self.get_sim_timestamp() - int(movement_action.get("started_at", self.get_sim_timestamp()))),
                 success=True, completed_at=self.get_sim_timestamp(),
             ))
-            plan = agent.mental_state.life_plan
-            if plan and movement_action.get("plan_step_id") == (plan.current_step.id if plan.current_step else ""):
-                plan.complete_step(
-                    str(movement_action.get("plan_step_id", "")),
-                    self.get_sim_timestamp(),
-                )
+            await self._complete_plan_step(
+                agent, str(movement_action.get("plan_step_id", "")),
+            )
             intention = agent.mental_state.relevant_intention(movement_action)
             if intention:
                 agent.mental_state.transition_intention(
@@ -1195,12 +1215,7 @@ class SimulationEngine:
                 duration=elapsed, success=True, completed_at=self.get_sim_timestamp(),
             )
             agent.mental_state.record_outcome(outcome)
-            plan = agent.mental_state.life_plan
-            if plan and action.get("plan_step_id") == (plan.current_step.id if plan.current_step else ""):
-                plan.complete_step(
-                    str(action.get("plan_step_id", "")),
-                    self.get_sim_timestamp(),
-                )
+            await self._complete_plan_step(agent, str(action.get("plan_step_id", "")))
             intention = agent.mental_state.relevant_intention(action)
             if intention:
                 agent.mental_state.transition_intention(
@@ -1349,7 +1364,7 @@ class SimulationEngine:
             ))
             plan = agent.mental_state.life_plan
             if plan and decision.get("plan_step_id") == (plan.current_step.id if plan.current_step else ""):
-                plan.block_current_step(blocked.id, "; ".join(feasibility.reasons))
+                await self._block_plan(agent, plan, blocked.id, "; ".join(feasibility.reasons))
             await self._finish_interaction(
                 str(decision.get("interaction_id", "")), "blocked", fact_id=blocked.id,
             )
@@ -1397,7 +1412,7 @@ class SimulationEngine:
             )
             plan = agent.mental_state.life_plan
             if plan and decision.get("plan_step_id") == (plan.current_step.id if plan.current_step else ""):
-                plan.block_current_step(blocked.id, "执行器未能启动已验证行动")
+                await self._block_plan(agent, plan, blocked.id, "执行器未能启动已验证行动")
             agent.mental_state.record_outcome(ActionOutcome(
                 action_id=str(decision.get("action_id", "")), actual_effects=[],
                 duration=0, success=False, completed_at=self.get_sim_timestamp(),

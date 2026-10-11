@@ -185,6 +185,9 @@ class LifePlan:
     status: str = "active"
     replan_reason: str = ""
     id: str = field(default_factory=lambda: _id("plan"))
+    purpose: str = ""
+    experience_id: str = ""
+    start_location: str = ""
 
     @property
     def current_step(self) -> PlanStep | None:
@@ -346,6 +349,22 @@ class MentalState:
     expectations: dict[str, ActionExpectation] = field(default_factory=dict)
     outcomes: list[ActionOutcome] = field(default_factory=list)
     last_decision: dict = field(default_factory=dict)
+
+    def complete_plan_step(self, step_id: str, now: int) -> dict | None:
+        plan = self.life_plan
+        if not plan or not plan.complete_step(step_id, now) or plan.status != "completed":
+            return
+        if (len(plan.steps) < 2 or any(step.status != "completed" for step in plan.steps)
+                or not any(step.action.get("interaction_type") not in {"move", "wait", "inspect"}
+                           for step in plan.steps)):
+            return
+        # The store owns action sanitization and structural deduplication.
+        actions = [dict(step.action) for step in plan.steps]
+        return {
+            "purpose": plan.purpose or plan.focus, "focus": plan.focus,
+            "start_location": plan.start_location,
+            "actions": actions, "completed_at": now,
+        }
 
     @property
     def active_goal_object(self) -> Goal | None:
@@ -637,6 +656,7 @@ class MentalState:
                 "motive": self.life_plan.motive,
                 "status": self.life_plan.status,
                 "review_at": self.life_plan.review_at,
+                "experience_id": self.life_plan.experience_id,
                 "current_step": asdict(step) if step else None,
             }
         result = {
@@ -649,12 +669,11 @@ class MentalState:
             "life_plan": plan,
         }
         if task_type in {"action_decision", "dialogue", "reflection"}:
+            result["recent_outcomes"] = [asdict(item) for item in self.outcomes[-outcome_limit:]]
             result["beliefs"] = [
                 asdict(item) for item in self.beliefs[-belief_limit:]
                 if item.status != "disproven"
             ]
-        if task_type in {"action_decision", "dialogue", "reflection"}:
-            result["recent_outcomes"] = [asdict(item) for item in self.outcomes[-outcome_limit:]]
         if task_type in {"action_decision", "dialogue"}:
             result["recent_interactions"] = {
                 key: asdict(value) for key, value in list(self.recent_interactions.items())[-4:]

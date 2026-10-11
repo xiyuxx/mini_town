@@ -576,12 +576,19 @@ class Agent:
 
     async def _build_planning_context(self, sim_time_str: str,
                                       engine_ref: "SimulationEngine",
-                                      task_type: str = "life_plan") -> dict:
+                                      task_type: str = "life_plan",
+                                      fields: set[str] | None = None,
+                                      query: str = "") -> dict:
         time_part = sim_time_str.split(" ")[-1]
         hour, minute = map(int, time_part.split(":"))
         # Build perception context
         perception = self.perceive(engine_ref)
         schedule_text = self.get_schedule_for_time(hour, minute)
+        if task_type == "daily_plan":
+            schedule_text = "\n".join(
+                f"{item.hour:02d}:{item.minute:02d} {item.label} · {item.location}"
+                for item in self.schedule if not item.is_flexible_slot
+            )
         current_commitment = self.get_current_commitment(engine_ref.day, hour, minute)
         if current_commitment and current_commitment.get("status") == "completed":
             schedule_text += "\n本时段的日程已经完成，可以做一项符合身份和地点的短暂自由活动，不要重复日程。"
@@ -592,9 +599,12 @@ class Agent:
             self.id, self.state.current_location,
             nearby_agents=perception["nearby_agents"],
             current_sim_timestamp=engine_ref.get_sim_timestamp(),
-        )
+            query=query, limit=12,
+        ) if fields is None or "relevant_memories" in fields else []
         mem_text = memories_to_text(memories)
-        open_loops = await self.memory.get_open_loops(self.id)
+        open_loops = await self.memory.get_open_loops(self.id) if (
+            fields is None or "open_loops" in fields
+        ) else []
         open_loop_text = "\n".join(
             f"- {memory.future_intention or memory.content}" for memory in open_loops
         ) or "（无）"
@@ -607,11 +617,10 @@ class Agent:
             ) if nearby.id != self.id
         }
         recent_interactions = {
-            name: mental_context["recent_interactions"].get(agent_id)
+            name: mental_context.get("recent_interactions", {}).get(agent_id)
             for name, agent_id in nearby_ids.items()
-            if mental_context["recent_interactions"].get(agent_id)
+            if mental_context.get("recent_interactions", {}).get(agent_id)
         }
-        affordances = location_affordances(self.state.current_location)
         weather_cost = travel_cost(perception["weather"])
         needs = self.state.needs
         need_context = {
@@ -652,8 +661,9 @@ class Agent:
                 "id": fact.id, "time": fact.sim_time, "type": fact.type,
                 "location": fact.location, "details": fact.details,
             }
-            for fact in engine_ref.fact_ledger.known_for(self.id, limit=30)
-        ]
+            for fact in engine_ref.fact_ledger.known_for(self.id, limit=12)
+            if fact.sim_timestamp <= now
+        ] if fields is None or "known_facts" in fields else []
         planner_context = {
             "world": {
                 "id": engine_ref.world_pack.id,
@@ -679,8 +689,8 @@ class Agent:
                 "available_processes": engine_ref.resources.processes_at(
                     self.state.current_location
                 ),
-            },
-            "inventory": engine_ref.resources.inventory(self.id),
+            } if fields is None or "location" in fields else {},
+            "inventory": engine_ref.resources.inventory(self.id) if fields is None or "inventory" in fields else [],
             "nearby_agents": [
                 {
                     "id": nearby.id, "name": nearby.name,
@@ -699,7 +709,9 @@ class Agent:
             "needs": need_context,
             "mental_state": mental_context,
             "daily_plan": self.daily_plan.to_dict() if self.daily_plan else None,
-            "routine_blocks": [block.to_dict() for block in self.routine_blocks],
+            "routine_blocks": [block.to_dict() for block in self.routine_blocks] if (
+                fields is None or "routine_blocks" in fields
+            ) else [],
             "known_facts": known_facts,
             "recent_observation": dict(self._last_observation) if self._last_observation else None,
             "recent_interactions": recent_interactions,
@@ -714,7 +726,7 @@ class Agent:
                 "mobility.travel_required为true时，候选中必须包含move；若已晚于latest_departure，选择非移动行动必须有可引用的更高优先级事实或目标，不能用等待、观察、热身等填充动作逃避出发责任",
             ],
         }
-        return planner_context
+        return {key: value for key, value in planner_context.items() if fields is None or key in fields}
 
     # ── Execution ─────────────────────────────────────────────
 

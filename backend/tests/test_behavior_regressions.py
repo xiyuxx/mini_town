@@ -587,5 +587,6 @@ def test_realtime_mode_replans_after_a_blocked_plan_step(tmp_path):
         assert reasons == ["观察到服务台当前无人值守"]
         assert artist.state.status == "ACTING"
         assert artist.state.current_action == "查看替代安排"
+        await engine.shutdown()
 
     run(scenario())

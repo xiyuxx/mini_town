@@ -16,18 +16,13 @@ class CognitivePlanner:
         if not candidates:
             raise ValueError("routine selection requires candidates")
         candidate_map = {candidate.id: candidate for candidate in candidates}
+        context = await engine.context.build(agent, "routine_selection", engine)
         raw = await self._json_call(
             """你是当前世界中的角色。系统已经生成并验证了可选的自由时间活动。
 只能从给定candidate_id中选一个，不得发明地点、人物、行动或事实。
 只输出JSON：{"candidate_id":"候选ID","brief_reason":"基于给定理由的简短选择依据","mental_update":{}}。
 选择依据可以考虑当前需要、既有习惯、地点中的人物和今日生活方向，但不要复述内部数值。""",
-            {
-                "character": agent.persona_text(),
-                "sim_time": engine.get_sim_time_str(),
-                "needs": agent.state.needs,
-                "daily_plan": agent.daily_plan.to_dict() if agent.daily_plan else None,
-                "candidates": [candidate.to_dict() for candidate in candidates],
-            },
+            {**context, "candidates": [candidate.to_dict() for candidate in candidates]},
             mode="chat", task="routine_selection",
         )
         selected_id = str(raw.get("candidate_id", ""))
@@ -70,9 +65,8 @@ interaction_type只能是move, consume, rest, communicate, inspect, request_serv
         """Create a stable coarse plan; executable actions are chosen later."""
         if self.llm.fallback:
             raise RuntimeError("daily planner unavailable in fallback mode")
-        context, _ = await self._resolve_intention_context(
-            agent, engine, context, "daily_plan",
-        )
+        if context.get("request", {}).get("task_type") != "daily_plan":
+            context = await engine.context.build(agent, "daily_plan", engine)
         raw = await self._json_call(
             """你负责为角色生成今天的大致生活安排，不要生成逐tick动作。只输出JSON：
 {"focus":"今天最在意的事情","review_after_minutes":180,"blocks":[{"id":"morning","window":[360,720],"intent":"上午的生活意图","candidates":[{"interaction_type":"act","content":"旁观者可见的活动","location":"地点ID"}],"priority":0.5,"flexibility":0.7}]}
@@ -90,20 +84,35 @@ blocks必须是1至6个不重叠的时间区块，window使用当天的分钟数
                                replan_reason: str = "") -> LifePlan:
         if self.llm.fallback:
             raise RuntimeError("life planner unavailable in fallback mode")
-        context, _ = await self._resolve_intention_context(
+        context, intention = await self._resolve_intention_context(
             agent, engine, context, "life_plan",
         )
+        experiences = await engine.procedure_store.discover(agent, engine, intention)
         raw = await self._json_call(
             """你负责为角色形成一段连续生活计划，不逐tick重新决策。只输出JSON：
 {"focus":"接下来一段时间在意的事情","motive":"角色自己的简短动机","review_after_minutes":60,"goal_ids":[],"steps":[{"description":"旁观者可见的自然行动","action":{"interaction_type":"move","content":"自然行动描述","location":"地点ID","duration_minutes":15},"expected_outcome":[]}]}
 steps必须有1至6项，并按真实执行顺序排列。普通生活不需要列多个候选。
+若给定experiences中的摘要适合当前意图，可输出{"experience_id":"经验ID"}由系统加载步骤；无合适经验则生成新steps。经验是历史方法，不能把历史结果当成当前事实。
 interaction_type只能是move, consume, rest, communicate, inspect, request_service, take, put, transfer, use_resource, operate, produce, work_on_goal, wait。
 move必须填写known_locations中的location ID。work_on_goal必须填写当前有效goal_id与progress_delta。环境操作必须引用上下文中可见的结构化ID。request_service只能在当前位置、完成inspect后请求可见服务台提供的真实商品；成功后商品进入背包，随后才能consume。
 计划要有连续性：准备、移动和到达后的活动应是不同步骤。不要用等待、观察、休息填充时间；只有角色确实在等待某个条件、需要观察未知信息或需要恢复时才能安排。
 content不得包含ID、括号假设或系统校验说明。不要补写上下文没有的事实。""",
-            {**context, "replan_reason": replan_reason},
+            {**context, "replan_reason": replan_reason, "experiences": experiences},
             mode="chat", task="life_plan",
         )
+        selected = next((item for item in experiences if item["id"] == raw.get("experience_id")), None)
+        if selected:
+            selected_id = selected["id"]
+            selected = await engine.procedure_store.load(
+                agent.id, selected_id, engine.get_sim_timestamp(),
+            )
+            reused = self._reuse_experience(agent, engine, selected, intention) if selected else None
+            if reused:
+                return reused
+            if selected:
+                await engine.procedure_store.fail(
+                    agent.id, selected_id, "当前条件不可用，无法开始经验步骤", engine.get_sim_timestamp(),
+                )
         raw_steps = raw.get("steps") if isinstance(raw.get("steps"), list) else []
         steps = []
         for item in raw_steps[:6]:
@@ -132,6 +141,23 @@ content不得包含ID、括号假设或系统校验说明。不要补写上下�
             goal_ids=[str(value) for value in raw.get("goal_ids", [])],
             steps=steps,
             replan_reason=replan_reason[:240],
+            purpose=intention["purpose"], start_location=agent.state.current_location,
+        )
+
+    @staticmethod
+    def _reuse_experience(agent, engine, experience: dict, intention: dict) -> LifePlan | None:
+        steps = [PlanStep(description=action.get("content", ""), action=dict(action))
+                 for action in experience["actions"]]
+        if not steps or not engine.interactions.validate(agent, steps[0].action, engine).feasible:
+            return None
+        active_goals = {goal.id for goal in agent.mental_state.goals if goal.status == "active"}
+        if any(step.action.get("goal_id") and step.action["goal_id"] not in active_goals for step in steps):
+            return None
+        now = engine.get_sim_timestamp()
+        return LifePlan(
+            focus=experience["focus"], motive="沿用成功经验", created_at=now,
+            review_at=now + 60, steps=steps, purpose=intention["purpose"],
+            experience_id=experience["id"], start_location=agent.state.current_location,
         )
 
     def next_plan_action(self, agent, engine) -> dict:
@@ -156,7 +182,7 @@ content不得包含ID、括号假设或系统校验说明。不要补写上下�
             "plan_id": plan.id,
             "plan_step_id": step.id,
             "predicted_effects": step.expected_outcome,
-            "source": "life_plan",
+            "source": "experience" if plan.experience_id else "life_plan",
         })
         result = engine.interactions.validate(agent, action, engine, step.id)
         if not result.feasible:

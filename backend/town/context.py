@@ -4,7 +4,6 @@ import json
 from collections import deque
 
 from .considerations import collect_active_considerations
-from .memory import memories_to_text
 from .world_query import WorldQuery
 
 
@@ -39,7 +38,7 @@ class ContextService:
             "relevant_memories", "open_loops", "principles", "active_considerations",
         },
         "routine_selection": {
-            "world", "sim_time", "character", "needs", "mental_state",
+            "world", "sim_time", "character", "needs", "mental_state", "daily_plan",
             "nearby_agents", "relevant_memories", "active_considerations",
         },
         "dialogue": {
@@ -69,13 +68,13 @@ class ContextService:
                     sim_time_str: str | None = None) -> dict:
         """Build a task-specific view from the existing planning data source."""
         task_type = str(task_type or "action_decision")
-        # Reuse the existing bounded memory/resource/perception queries while
-        # replacing only the broad state sections before the LLM sees them.
+        fields = self._FIELDS.get(task_type, self._FIELDS["action_decision"])
+        current_intention = intention or self._current_intention(agent, engine)
         context = await agent._build_planning_context(
             sim_time_str or engine.get_sim_time_str(), engine, task_type=task_type,
+            fields=fields, query=str(current_intention.get("purpose", "")).strip(),
         )
         now = engine.get_sim_timestamp()
-        current_intention = intention or self._current_intention(agent, engine)
         context["request"] = {
             "agent_id": agent.id,
             "task_type": task_type,
@@ -85,25 +84,16 @@ class ContextService:
             "plan_id": str((current_intention or {}).get("plan_id", "")),
             "plan_step_id": str((current_intention or {}).get("plan_step_id", "")),
         }
-        context["mental_state"] = agent.mental_state.summary_for(task_type, now)
         context["active_considerations"] = [
             item.to_dict() for item in collect_active_considerations(agent, engine)
         ]
-        context["known_locations"] = self.world_query.locations_for_intention(
-            agent, engine, current_intention, limit=6,
-        )
-        purpose = str((current_intention or {}).get("purpose", "")).strip()
-        if purpose:
-            perception = agent.perceive(engine)
-            memories = await agent.memory.retrieve(
-                agent.id, agent.state.current_location,
-                nearby_agents=perception["nearby_agents"],
-                current_sim_timestamp=now, query=purpose, limit=12,
+        if "known_locations" in fields:
+            intentions = self._daily_intentions(agent, engine) if task_type == "daily_plan" else current_intention
+            context["known_locations"] = self.world_query.locations_for_intention(
+                agent, engine, intentions, limit=6,
             )
-            context["relevant_memories"] = memories_to_text(memories)
         context["known_facts"] = list(context.get("known_facts", []))[-12:]
         context["routine_blocks"] = self._routine_view(agent, engine, task_type)
-        fields = self._FIELDS.get(task_type, self._FIELDS["action_decision"])
         result = {
             "request": context["request"],
             **{key: value for key, value in context.items() if key in fields},
@@ -119,6 +109,22 @@ class ContextService:
             "inputChars": len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))),
         })
         return result
+
+    @staticmethod
+    def _daily_intentions(agent, engine) -> list[dict]:
+        """Cover the whole day's commitments, needs and flexible activities."""
+        intentions = [{"target_location": item.location} for item in agent.schedule
+                      if not item.is_flexible_slot]
+        intentions.extend(
+            {"target_location": location}
+            for block in agent.routine_blocks for location in block.candidate_locations
+        )
+        intentions.extend(
+            {"interaction_type": item.interaction_type, "target_location": item.target_location}
+            for item in agent.mental_state.open_intentions(engine.get_sim_timestamp())
+        )
+        intentions.extend([{"resource_kind": "food"}, {"interaction_type": "rest"}])
+        return intentions
 
     @staticmethod
     def _current_intention(agent, engine) -> dict:

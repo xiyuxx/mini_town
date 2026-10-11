@@ -10,17 +10,15 @@ class WorldQuery:
         self.world_pack = world_pack
         self.resources = resources
 
-    def locations_for_intention(self, agent, engine, intention: dict | None = None,
+    def locations_for_intention(self, agent, engine, intention: dict | list[dict] | None = None,
                                 limit: int = 6) -> list[dict]:
-        """Return accessible, reachable locations relevant to an intention."""
-        intention = intention if isinstance(intention, dict) else {}
-        interaction_type = str(intention.get("interaction_type", ""))
-        target_location = str(intention.get("target_location", ""))
-        target_agent_id = str(intention.get("target_agent_id", ""))
-        resource_kind = str(intention.get("resource_kind", ""))
-        target_agent = next(
-            (item for item in engine.agents if item.id == target_agent_id), None
-        )
+        """Return accessible, reachable locations relevant to one or more intents."""
+        intentions = intention if isinstance(intention, list) else [intention or {}]
+        types = {str(item.get("interaction_type", "")) for item in intentions}
+        targets = list(dict.fromkeys(str(item.get("target_location", "")) for item in intentions))
+        resource_kinds = {str(item.get("resource_kind", "")) for item in intentions} - {""}
+        agent_ids = {item.get("target_agent_id") for item in intentions}
+        agent_locations = {item.state.current_location for item in engine.agents if item.id in agent_ids}
         ranked: list[tuple[float, dict]] = []
         for location in LOCATION_MAP.values():
             if not can_enter(agent.id, location.id):
@@ -40,23 +38,21 @@ class WorldQuery:
             reasons: list[str] = []
             if is_current:
                 reasons.append("当前地点")
-            if location.id == target_location:
+            if location.id in targets:
                 score += 3.0
                 reasons.append("意图指定地点")
-            if target_agent and target_agent.state.current_location == location.id:
+            if location.id in agent_locations:
                 score += 2.0
                 reasons.append("目标角色在此处")
-            if resource_kind:
-                matching = self.resources.at_location(location.id, kind=resource_kind)
-                if matching:
-                    score += 1.2
-                    reasons.append("有相关可用资源")
-            if interaction_type in {"operate", "produce", "use_resource"}:
+            if any(self.resources.at_location(location.id, kind=kind) for kind in resource_kinds):
+                score += 1.2
+                reasons.append("有相关可用资源")
+            if types & {"operate", "produce", "use_resource"}:
                 processes = self.resources.processes_at(location.id)
                 if processes:
                     score += 0.8
                     reasons.append("有可用过程")
-            if interaction_type in {"communicate", "request_service"}:
+            if types & {"communicate", "request_service"}:
                 nearby = sum(
                     1 for other in engine.agents
                     if other.id != agent.id and other.state.current_location == location.id
@@ -78,14 +74,11 @@ class WorldQuery:
             }))
 
         ranked.sort(key=lambda item: (-item[0], item[1]["id"]))
-        selected = [item for _, item in ranked[:max(1, limit)]]
-        if target_location and target_location in LOCATION_MAP and can_enter(agent.id, target_location):
-            target = next((item for item in selected if item["id"] == target_location), None)
-            if target is None:
-                target = self._location_view(agent, engine, target_location)
-                if target["reachable"]:
-                    selected[-1] = target
-        return selected
+        views = {item["id"]: item for _, item in ranked}
+        required = list(dict.fromkeys([*targets, *sorted(agent_locations), agent.state.current_location]))
+        selected = [views[key] for key in required if key in views][:max(1, limit)]
+        selected.extend(item for _, item in ranked if item not in selected)
+        return selected[:max(1, limit)]
 
     def visible_environment(self, agent, engine, target_id: str = "") -> dict:
         """Return the existing observation snapshot as a world interface."""
@@ -107,22 +100,3 @@ class WorldQuery:
                 "condition": weather.get("condition", ""),
             })
         return constraints
-
-    def _location_view(self, agent, engine, location_id: str) -> dict:
-        location = LOCATION_MAP[location_id]
-        is_current = location.id == agent.state.current_location
-        path = [] if is_current else bfs_path(
-            agent.state.x, agent.state.y, *location.center,
-            agent_id=agent.id, target_location_id=location.id,
-        )
-        return {
-            "id": location.id,
-            "name": location.name,
-            "type": location.type,
-            "accessible": can_enter(agent.id, location.id),
-            "reachable": is_current or bool(path),
-            "distance": len(path),
-            "estimated_travel_minutes": len(path) * 5,
-            "relevance": 1.0,
-            "reasons": ["意图指定地点"],
-        }
